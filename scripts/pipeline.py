@@ -1,5 +1,5 @@
 """
-Douyin Transcriber Pipeline (v3)
+Douyin Downloader Pipeline (v4)
 ================================
 Download and transcribe Douyin videos to text.
 
@@ -7,7 +7,12 @@ Supports:
 - Single video URL: download + transcribe one video
 - User profile URL: scrape all videos, ask for confirmation, then batch process
 
-Output: one markdown file per video in the output directory.
+Features:
+- One markdown file per video
+- Cookie persistence (login once, reuse session)
+- Auto-resume via state.json (skip already-completed videos)
+- Auto-retry failed downloads (up to 2 retries)
+- Built-in rate limiting
 
 Usage:
     python pipeline.py "https://www.douyin.com/video/xxxxx" --output-dir ~/transcripts/
@@ -39,12 +44,14 @@ CHALLENGE_MAX_WAIT = 45
 SCROLL_PAUSE = 3.0
 SCROLL_MAX_NO_NEW = 10
 DEFAULT_WORK_DIR = "/tmp/douyin-transcriber"
+DEFAULT_COOKIES_FILE = os.path.expanduser("~/.douyin-cookies.json")
 CONCURRENT_DOWNLOADS = 2
 BATCH_SIZE = 5
 BATCH_PAUSE_MIN = 30
 BATCH_PAUSE_MAX = 60
 DOWNLOAD_DELAY_MIN = 8
 DOWNLOAD_DELAY_MAX = 18
+MAX_RETRIES = 2
 
 
 # ---------------------------------------------------------------------------
@@ -52,10 +59,7 @@ DOWNLOAD_DELAY_MAX = 18
 # ---------------------------------------------------------------------------
 
 def detect_url_type(url: str) -> str:
-    """Detect whether the URL is a single video or a user profile.
-
-    Returns 'video', 'user', or 'unknown'.
-    """
+    """Returns 'video', 'user', or 'unknown'."""
     if re.search(r"/video/\d+", url):
         return "video"
     if re.search(r"/user/", url):
@@ -64,16 +68,98 @@ def detect_url_type(url: str) -> str:
 
 
 def extract_video_id_from_url(url: str) -> Optional[str]:
-    """Extract video ID from a single video URL."""
     m = re.search(r"/video/(\d+)", url)
     return m.group(1) if m else None
+
+
+# ---------------------------------------------------------------------------
+# 0.5) Cookie persistence
+# ---------------------------------------------------------------------------
+
+def save_cookies(cookies: list, cookies_file: str) -> None:
+    """Save browser cookies to a JSON file."""
+    path = Path(cookies_file)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(cookies, ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.info(f"Cookies saved to {cookies_file} ({len(cookies)} cookies)")
+
+
+def load_cookies(cookies_file: str) -> list:
+    """Load cookies from a JSON file. Returns empty list if file doesn't exist."""
+    path = Path(cookies_file)
+    if not path.exists():
+        return []
+    try:
+        cookies = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(cookies, list) and cookies:
+            logger.info(f"Loaded {len(cookies)} cookies from {cookies_file}")
+            return cookies
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning(f"Failed to load cookies: {e}")
+    return []
+
+
+# ---------------------------------------------------------------------------
+# 0.6) State tracking (auto-resume)
+# ---------------------------------------------------------------------------
+
+class StateTracker:
+    """Track completed video IDs for auto-resume. Persists to state.json in output dir."""
+
+    def __init__(self, output_dir: Path):
+        self._path = output_dir / "state.json"
+        self._state = self._load()
+
+    def _load(self) -> dict:
+        if self._path.exists():
+            try:
+                data = json.loads(self._path.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    logger.info(
+                        f"Resumed state: {len(data.get('completed', []))} completed, "
+                        f"{len(data.get('failed', []))} failed"
+                    )
+                    return data
+            except (json.JSONDecodeError, OSError):
+                pass
+        return {"completed": [], "failed": []}
+
+    def _save(self) -> None:
+        self._path.write_text(
+            json.dumps(self._state, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    def is_completed(self, video_id: str) -> bool:
+        return video_id in self._state["completed"]
+
+    def mark_completed(self, video_id: str) -> None:
+        if video_id not in self._state["completed"]:
+            self._state["completed"].append(video_id)
+        # Remove from failed if it was there
+        self._state["failed"] = [
+            v for v in self._state["failed"] if v != video_id
+        ]
+        self._save()
+
+    def mark_failed(self, video_id: str) -> None:
+        if video_id not in self._state["failed"]:
+            self._state["failed"].append(video_id)
+        self._save()
+
+    @property
+    def completed_count(self) -> int:
+        return len(self._state["completed"])
+
+    @property
+    def failed_ids(self) -> list:
+        return list(self._state["failed"])
 
 
 # ---------------------------------------------------------------------------
 # 1) Scrape single video metadata
 # ---------------------------------------------------------------------------
 
-async def scrape_single_video(video_url: str) -> list:
+async def scrape_single_video(video_url: str, cookies_file: str = DEFAULT_COOKIES_FILE) -> list:
     """Return a single-element list with {url, title, date, video_id} for one video."""
     from playwright.async_api import async_playwright
 
@@ -89,6 +175,8 @@ async def scrape_single_video(video_url: str) -> list:
         "video_id": video_id,
     }
 
+    cookies = load_cookies(cookies_file)
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
@@ -99,8 +187,11 @@ async def scrape_single_video(video_url: str) -> list:
             ),
             locale="zh-CN",
         )
-        page = await context.new_page()
 
+        if cookies:
+            await context.add_cookies(cookies)
+
+        page = await context.new_page()
         detail_data = None
 
         async def capture_detail(response):
@@ -120,7 +211,6 @@ async def scrape_single_video(video_url: str) -> list:
 
         await page.wait_for_timeout(5000)
 
-        # Try to get title from detail API
         if detail_data and isinstance(detail_data, dict):
             aweme = detail_data.get("aweme_detail", {})
             if isinstance(aweme, dict):
@@ -131,7 +221,6 @@ async def scrape_single_video(video_url: str) -> list:
                 if ct:
                     result["date"] = datetime.fromtimestamp(ct).strftime("%Y-%m-%d")
 
-        # Fallback: try page title
         if result["title"].startswith("video_"):
             try:
                 page_title = await page.title()
@@ -139,6 +228,11 @@ async def scrape_single_video(video_url: str) -> list:
                     result["title"] = page_title.strip()
             except Exception:
                 pass
+
+        # Save cookies for future use
+        new_cookies = await context.cookies()
+        if new_cookies:
+            save_cookies(new_cookies, cookies_file)
 
         await browser.close()
 
@@ -150,12 +244,15 @@ async def scrape_single_video(video_url: str) -> list:
 # 2) Scrape user profile for video list
 # ---------------------------------------------------------------------------
 
-async def scrape_user_videos(user_url: str, max_videos: int = 0) -> list:
+async def scrape_user_videos(
+    user_url: str, max_videos: int = 0, cookies_file: str = DEFAULT_COOKIES_FILE,
+) -> list:
     """Return list of {url, title, date, video_id} for every video on a user's profile."""
     from playwright.async_api import async_playwright
 
     seen_ids = set()
     api_videos = []
+    cookies = load_cookies(cookies_file)
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -168,6 +265,10 @@ async def scrape_user_videos(user_url: str, max_videos: int = 0) -> list:
             locale="zh-CN",
             viewport={"width": 1280, "height": 800},
         )
+
+        if cookies:
+            await context.add_cookies(cookies)
+
         page = await context.new_page()
 
         async def block_assets(route):
@@ -236,11 +337,10 @@ async def scrape_user_videos(user_url: str, max_videos: int = 0) -> list:
         except asyncio.TimeoutError:
             logger.warning("Timeout waiting for first API response")
 
-        # Scroll to trigger pagination
         await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         await page.wait_for_timeout(3000)
 
-        # Paginate via scroll (requires login for pages beyond the first)
+        # Paginate via scroll
         no_new_count = 0
         prev_count = len(api_videos)
         for _ in range(100):
@@ -263,7 +363,7 @@ async def scrape_user_videos(user_url: str, max_videos: int = 0) -> list:
             if max_videos > 0 and current_count >= max_videos:
                 break
 
-        # Fallback to DOM if API interception found nothing
+        # Fallback to DOM
         if not api_videos:
             logger.info("API interception found no videos, falling back to DOM parsing")
             links = await page.evaluate("""() => {
@@ -288,6 +388,11 @@ async def scrape_user_videos(user_url: str, max_videos: int = 0) -> list:
                         "date": "unknown",
                         "video_id": vid,
                     })
+
+        # Save cookies for future use
+        new_cookies = await context.cookies()
+        if new_cookies:
+            save_cookies(new_cookies, cookies_file)
 
         await browser.close()
 
@@ -344,10 +449,8 @@ async def _get_video_src(page, video_url: str) -> Optional[str]:
 
     if aweme_detail:
         src = _extract_src_from_detail(aweme_detail)
-
     if not src and media_candidates:
         src = media_candidates[0]
-
     if not src:
         try:
             src = await page.evaluate("""() => {
@@ -361,9 +464,7 @@ async def _get_video_src(page, video_url: str) -> Optional[str]:
         except Exception:
             src = None
 
-    if src and src.startswith("http"):
-        return src
-    return None
+    return src if (src and src.startswith("http")) else None
 
 
 async def download_single_audio(
@@ -426,7 +527,6 @@ async def download_single_audio(
              str(output_audio.with_suffix(".aac"))],
             capture_output=True, text=True,
         )
-
         if result.returncode != 0:
             result = subprocess.run(
                 ["ffmpeg", "-y", "-i", str(video_file), "-vn", "-acodec", "libmp3lame",
@@ -446,6 +546,22 @@ async def download_single_audio(
             return False
 
         return output_audio.exists()
+
+
+async def download_with_retry(
+    video_url: str, output_audio: Path, semaphore: asyncio.Semaphore,
+    delay: float = 0, max_retries: int = MAX_RETRIES,
+) -> bool:
+    """Download with automatic retry on failure."""
+    for attempt in range(1, max_retries + 1):
+        ok = await download_single_audio(video_url, output_audio, semaphore, delay=(delay if attempt == 1 else 0))
+        if ok:
+            return True
+        if attempt < max_retries:
+            wait = random.uniform(5, 15)
+            logger.info(f"Retry {attempt}/{max_retries} in {wait:.0f}s for {video_url[-20:]}")
+            await asyncio.sleep(wait)
+    return False
 
 
 def _extract_src_from_detail(detail_payload: dict) -> Optional[str]:
@@ -493,11 +609,11 @@ def _first_http(urls) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# 4) Transcribe with mlx-whisper or fallback to openai-whisper
+# 4) Transcribe
 # ---------------------------------------------------------------------------
 
 def transcribe_audio_mlx(audio_path: Path, model: str = "small", language: str = "zh") -> str:
-    """Transcribe using mlx-whisper (5-10x faster on Apple Silicon)."""
+    """Transcribe using mlx-whisper (Apple Silicon) or fallback to openai-whisper."""
     try:
         import mlx_whisper
         model_map = {
@@ -521,7 +637,6 @@ def transcribe_audio_mlx(audio_path: Path, model: str = "small", language: str =
 
 
 def _transcribe_audio_cli(audio_path: Path, model: str = "small", language: str = "zh") -> str:
-    """Fallback: use openai-whisper CLI."""
     result = subprocess.run(
         ["whisper", str(audio_path), "--model", model, "--language", language,
          "--output_format", "txt", "--output_dir", str(audio_path.parent)],
@@ -543,15 +658,13 @@ def _transcribe_audio_cli(audio_path: Path, model: str = "small", language: str 
 # ---------------------------------------------------------------------------
 
 def _safe_filename(title: str, max_len: int = 80) -> str:
-    """Create a filesystem-safe filename from a video title."""
     safe = re.sub(r'[\\/:*?"<>|\n\r#]', '', title)
     return safe[:max_len].strip()
 
 
 def write_transcript_file(
-    output_dir: Path, index: int, video: dict, text: str, source_url: str,
+    output_dir: Path, index: int, video: dict, text: str,
 ) -> Path:
-    """Write a single transcript to its own markdown file. Returns the file path."""
     num = str(index).zfill(2)
     safe_title = _safe_filename(video["title"])
     filename = f"{num}-{safe_title}.md"
@@ -581,6 +694,7 @@ async def run_pipeline(
     concurrency: int = CONCURRENT_DOWNLOADS,
     skip: int = 0,
     auto_confirm: bool = False,
+    cookies_file: str = DEFAULT_COOKIES_FILE,
 ):
     work = Path(work_dir)
     work.mkdir(parents=True, exist_ok=True)
@@ -588,28 +702,37 @@ async def run_pipeline(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     url_type = detect_url_type(url)
+    state = StateTracker(out_dir)
 
     # --- Single video ---
     if url_type == "video":
         logger.info("Detected: single video URL")
-        videos = await scrape_single_video(url)
+        video_id = extract_video_id_from_url(url)
+        if video_id and state.is_completed(video_id):
+            logger.info(f"Video {video_id} already completed (in state.json). Skipping.")
+            return
+
+        videos = await scrape_single_video(url, cookies_file=cookies_file)
         if not videos:
             logger.error("Failed to get video info.")
             return
-        # Download + transcribe
+
         video = videos[0]
         safe_name = re.sub(r'[^\w\-]', '_', video["video_id"])
         audio_file = work / f"{safe_name}.mp3"
         sem = asyncio.Semaphore(1)
-        ok = await download_single_audio(video["url"], audio_file, sem)
+        ok = await download_with_retry(video["url"], audio_file, sem)
         if not ok:
-            logger.error("Download failed.")
+            logger.error("Download failed after retries.")
+            state.mark_failed(video["video_id"])
             return
+
         logger.info(f"Transcribing: {video['title'][:50]}...")
         text = transcribe_audio_mlx(audio_file, model=whisper_model, language=language)
         if not keep_audio and audio_file.exists():
             audio_file.unlink()
-        filepath = write_transcript_file(out_dir, 1, video, text, url)
+        filepath = write_transcript_file(out_dir, 1, video, text)
+        state.mark_completed(video["video_id"])
         logger.info(f"Done! Output: {filepath}")
         return
 
@@ -619,18 +742,32 @@ async def run_pipeline(
         logger.info("=" * 60)
         logger.info("STEP 1: Scraping user profile...")
         logger.info("=" * 60)
-        videos = await scrape_user_videos(url, max_videos=max_videos)
+        videos = await scrape_user_videos(url, max_videos=max_videos, cookies_file=cookies_file)
 
         if not videos:
             logger.error("No videos found.")
             return
 
-        # Ask for confirmation (unless --yes flag)
+        # Filter out already-completed videos
+        already_done = sum(1 for v in videos if state.is_completed(v["video_id"]))
+        if already_done > 0:
+            logger.info(f"Skipping {already_done} already-completed videos (from state.json)")
+
+        # Ask for confirmation
+        pending = [v for v in videos if not state.is_completed(v["video_id"])]
+        if not pending:
+            logger.info("All videos already completed!")
+            return
+
         if not auto_confirm:
             print()
             print("=" * 60)
-            print(f"找到 {len(videos)} 个视频，确定要全部下载并转录吗？")
-            print(f"预计耗时：{len(videos) * 45 // 60} - {len(videos) * 75 // 60} 分钟")
+            if already_done > 0:
+                print(f"找到 {len(videos)} 个视频，其中 {already_done} 个已完成。")
+                print(f"剩余 {len(pending)} 个需要下载并转录。")
+            else:
+                print(f"找到 {len(videos)} 个视频，确定要全部下载并转录吗？")
+            print(f"预计耗时：{len(pending) * 45 // 60} - {len(pending) * 75 // 60} 分钟")
             print("输入 y 继续，n 取消，或输入数字限制下载数量：")
             print("=" * 60)
             answer = input("> ").strip().lower()
@@ -639,21 +776,21 @@ async def run_pipeline(
                 return
             if answer.isdigit():
                 limit = int(answer)
-                videos = videos[:limit]
-                logger.info(f"限制为前 {limit} 个视频")
+                pending = pending[:limit]
+                logger.info(f"限制为 {limit} 个视频")
             elif answer != "y":
                 logger.info("已取消。")
                 return
 
         if skip > 0:
-            logger.info(f"Skipping first {skip} videos (already processed)")
-            videos = videos[skip:]
+            logger.info(f"Skipping first {skip} pending videos")
+            pending = pending[skip:]
 
-        if not videos:
+        if not pending:
             logger.info("No remaining videos to process.")
             return
 
-        total = len(videos)
+        total = len(pending)
         logger.info(f"Starting batched pipeline for {total} videos...")
 
         semaphore = asyncio.Semaphore(concurrency)
@@ -661,8 +798,11 @@ async def run_pipeline(
         success_count = 0
         fail_count = 0
 
+        # Find the global index for numbering output files
+        all_ids = [v["video_id"] for v in videos]
+
         for batch_start in range(0, total, BATCH_SIZE):
-            batch = videos[batch_start:batch_start + BATCH_SIZE]
+            batch = pending[batch_start:batch_start + BATCH_SIZE]
             batch_num = batch_start // BATCH_SIZE + 1
 
             if batch_start > 0:
@@ -675,28 +815,30 @@ async def run_pipeline(
             audio_files = []
             download_tasks = []
             for i, video in enumerate(batch):
-                idx = batch_start + i + 1 + skip
-                safe_name = re.sub(r'[^\w\-]', '_', video.get("video_id", f"v{idx}"))
+                global_idx = all_ids.index(video["video_id"]) + 1
+                safe_name = re.sub(r'[^\w\-]', '_', video.get("video_id", f"v{global_idx}"))
                 audio_file = work / f"{safe_name}.mp3"
-                audio_files.append((idx, video, audio_file))
+                audio_files.append((global_idx, video, audio_file))
                 delay = i * random.uniform(DOWNLOAD_DELAY_MIN, DOWNLOAD_DELAY_MAX)
                 download_tasks.append(
-                    download_single_audio(video["url"], audio_file, semaphore, delay=delay)
+                    download_with_retry(video["url"], audio_file, semaphore, delay=delay)
                 )
 
             logger.info(f"Downloading {len(batch)} videos (max {concurrency} parallel)...")
             results = await asyncio.gather(*download_tasks, return_exceptions=True)
 
-            for (idx, video, audio_file), result in zip(audio_files, results):
+            for (global_idx, video, audio_file), result in zip(audio_files, results):
                 if isinstance(result, Exception) or result is False:
-                    logger.warning(f"[{idx}/{total+skip}] Download failed: {video['title'][:40]}")
-                    write_transcript_file(out_dir, idx, video, "[下载失败，已跳过]", url)
+                    logger.warning(f"[{global_idx}] Download failed: {video['title'][:40]}")
+                    write_transcript_file(out_dir, global_idx, video, "[下载失败，已跳过]")
+                    state.mark_failed(video["video_id"])
                     fail_count += 1
                     continue
 
-                logger.info(f"[{idx}/{total+skip}] Transcribing: {video['title'][:40]}...")
+                logger.info(f"[{global_idx}] Transcribing: {video['title'][:40]}...")
                 text = transcribe_audio_mlx(audio_file, model=whisper_model, language=language)
-                write_transcript_file(out_dir, idx, video, text, url)
+                write_transcript_file(out_dir, global_idx, video, text)
+                state.mark_completed(video["video_id"])
                 success_count += 1
 
                 if not keep_audio and audio_file.exists():
@@ -706,16 +848,15 @@ async def run_pipeline(
                 done = success_count + fail_count
                 remaining = total - done
                 eta = (elapsed / done) * remaining if done > 0 else 0
-                logger.info(f"[{idx}/{total+skip}] Done. ETA: {int(eta//60)}m{int(eta%60)}s")
+                logger.info(f"[{global_idx}] Done. ETA: {int(eta//60)}m{int(eta%60)}s")
 
         elapsed_total = time.monotonic() - start_time
         logger.info(f"ALL DONE! {success_count}/{total} videos in {int(elapsed_total//60)}m{int(elapsed_total%60)}s")
         logger.info(f"Output directory: {out_dir}")
         if fail_count > 0:
-            logger.warning(f"{fail_count} videos failed to download")
+            logger.warning(f"{fail_count} videos failed after retries")
         return
 
-    # --- Unknown URL ---
     logger.error(f"Cannot determine URL type: {url}")
     logger.error("Expected a Douyin video URL (/video/xxx) or user profile URL (/user/xxx)")
 
@@ -730,15 +871,16 @@ def main():
         "Supports single video URLs and user profile URLs.",
     )
     parser.add_argument("url", help="Douyin video or user profile URL")
-    parser.add_argument("--output-dir", default="./transcripts", help="Output directory for transcript files")
+    parser.add_argument("--output-dir", default="./transcripts", help="Output directory")
     parser.add_argument("--whisper-model", default="small", help="Whisper model: tiny/base/small/medium/large")
     parser.add_argument("--language", default="zh", help="Audio language for Whisper")
-    parser.add_argument("--max-videos", type=int, default=0, help="Max videos (0=all, only for user profiles)")
-    parser.add_argument("--keep-audio", action="store_true", help="Keep audio files after transcription")
+    parser.add_argument("--max-videos", type=int, default=0, help="Max videos (0=all)")
+    parser.add_argument("--keep-audio", action="store_true", help="Keep audio files")
     parser.add_argument("--work-dir", default=DEFAULT_WORK_DIR, help="Temp work directory")
     parser.add_argument("--concurrency", type=int, default=CONCURRENT_DOWNLOADS, help="Parallel downloads")
-    parser.add_argument("--skip", type=int, default=0, help="Skip first N videos (for resuming)")
-    parser.add_argument("-y", "--yes", action="store_true", help="Skip confirmation for batch downloads")
+    parser.add_argument("--skip", type=int, default=0, help="Skip first N pending videos")
+    parser.add_argument("-y", "--yes", action="store_true", help="Skip confirmation")
+    parser.add_argument("--cookies-file", default=DEFAULT_COOKIES_FILE, help="Cookie persistence file")
 
     args = parser.parse_args()
 
@@ -753,6 +895,7 @@ def main():
         concurrency=args.concurrency,
         skip=args.skip,
         auto_confirm=args.yes,
+        cookies_file=args.cookies_file,
     ))
 
 
